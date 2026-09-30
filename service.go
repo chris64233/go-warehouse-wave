@@ -165,7 +165,14 @@ func (s *Service) ReportShortage(req ReportShortageRequest) (*AllocationVersion,
 	}
 
 	oldVersion := w.versions[w.currentVersion-1]
-	oldIDs := append([]string(nil), oldVersion.entryIDs...)
+	// 只有当前版本上仍 active 的明细会被新版本取代；已全部拣出
+	// （completed）的明细永久持有所属批次的已拣数量，既不结转也不释放。
+	oldIDs := make([]string, 0, len(oldVersion.entryIDs))
+	for _, id := range oldVersion.entryIDs {
+		if w.entries[id].status == EntryActive {
+			oldIDs = append(oldIDs, id)
+		}
+	}
 
 	newEntries := make([]eventEntry, 0, len(oldIDs)+len(plan))
 	newIDs := make([]string, 0, cap(newEntries))

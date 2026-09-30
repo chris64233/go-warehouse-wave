@@ -183,7 +183,8 @@ func (s *Service) apply(ev event) error {
 		for _, id := range ev.SupersededEntryIDs {
 			old := w.entries[id]
 			if old.status != EntryActive {
-				return fmt.Errorf("replay: superseded entry %s in status %s", id, old.status)
+				// 已完成明细不参与重排（不结转、不释放）；重复/宽松重放时安全跳过。
+				continue
 			}
 			old.status = EntrySuperseded
 			s.batches[old.batchID].held -= old.remaining()

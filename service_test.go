@@ -510,3 +510,177 @@ func TestJournalReplay(t *testing.T) {
 		t.Fatalf("resubmit after replay must hit existing wave, got v%d", d2.CurrentVersion)
 	}
 }
+
+// ---- 3. 当前版本中部分明细已拣完后，仍可对其它明细缺货重排 ----
+
+func TestShortageAfterSiblingFullyPicked(t *testing.T) {
+	s := NewService()
+	mustRegister(t, s, BatchInput{ID: "BA", SKU: "A", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB", SKU: "B", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB2", SKU: "B", OnHand: 5, Expiry: date(2027, 1, 1), ReceivedAt: date(2026, 1, 1)})
+
+	d, err := s.CreateWave(CreateWaveRequest{WaveID: "W1", Lines: []OrderLine{
+		{OrderID: "O1", SKU: "A", Qty: 5},
+		{OrderID: "O1", SKU: "B", Qty: 5},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eA := entryByBatch(d.Entries, "BA")
+	eB := entryByBatch(d.Entries, "BB")
+
+	// A 行全部拣出（明细 completed）后，B 行报告全缺。
+	if _, err := s.ConfirmPick(ConfirmPickRequest{WaveID: "W1", EntryID: eA.ID, Version: 1, Qty: 5}); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := s.ReportShortage(ReportShortageRequest{WaveID: "W1", EntryID: eB.ID, Version: 1, Qty: 5})
+	if err != nil {
+		t.Fatalf("reallocation with a completed sibling entry: %v", err)
+	}
+
+	// v2 只包含 B 的补位明细；A 的已拣数量留在历史明细上。
+	if v2.Version != 2 || len(v2.Entries) != 1 {
+		t.Fatalf("v2 should contain only the backfill entry, got %+v", v2.Entries)
+	}
+	bf := v2.Entries[0]
+	if bf.BatchID != "BB2" || bf.Qty != 5 || bf.Reason != ReasonShortage {
+		t.Fatalf("backfill entry wrong: %+v", bf)
+	}
+
+	dd, _ := s.GetWave("W1")
+	v1 := dd.Versions[0].Entries
+	gotA := entryByBatch(v1, "BA")
+	gotB := entryByBatch(v1, "BB")
+	if gotA == nil || gotA.Status != EntryCompleted || gotA.Picked != 5 {
+		t.Fatalf("picked entry must remain completed in history: %+v", gotA)
+	}
+	if gotB == nil || gotB.Status != EntrySuperseded {
+		t.Fatalf("shortage entry must be superseded: %+v", gotB)
+	}
+
+	// 账面：BA 5 件永久拣出；BB 核销 5；BB2 占用 5。
+	bA, _ := s.GetBatch("BA")
+	bB, _ := s.GetBatch("BB")
+	bB2, _ := s.GetBatch("BB2")
+	if bA.OnHand != 5 || bA.Picked != 5 || bA.Held != 0 || bA.Available != 0 {
+		t.Fatalf("BA ledger wrong: %+v", bA)
+	}
+	if bB.OnHand != 0 || bB.Held != 0 || bB.Picked != 0 {
+		t.Fatalf("BB must be fully written off: %+v", bB)
+	}
+	if bB2.Held != 5 || bB2.Picked != 0 || bB2.Available != 0 {
+		t.Fatalf("BB2 backfill ledger wrong: %+v", bB2)
+	}
+
+	// v2 补位全部拣出后，波次跨版本累计完成（A 已在 v1 拣出）。
+	if _, err := s.ConfirmPick(ConfirmPickRequest{WaveID: "W1", EntryID: bf.ID, Version: 2, Qty: 5}); err != nil {
+		t.Fatal(err)
+	}
+	dd2, _ := s.GetWave("W1")
+	if dd2.Status != WaveStatusCompleted {
+		t.Fatalf("wave should complete across versions, got %s", dd2.Status)
+	}
+}
+
+// ---- 3. 部分拣出 + 同版本另一行短缺，结转与核销数量正确 ----
+
+func TestShortageWithPartialPickedCarry(t *testing.T) {
+	s := NewService()
+	mustRegister(t, s, BatchInput{ID: "BA", SKU: "A", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB", SKU: "B", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BA2", SKU: "A", OnHand: 5, Expiry: date(2027, 1, 1), ReceivedAt: date(2026, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB2", SKU: "B", OnHand: 5, Expiry: date(2027, 1, 1), ReceivedAt: date(2026, 1, 1)})
+
+	d, _ := s.CreateWave(CreateWaveRequest{WaveID: "W1", Lines: []OrderLine{
+		{OrderID: "O1", SKU: "A", Qty: 5},
+		{OrderID: "O1", SKU: "B", Qty: 5},
+	}})
+	eA := entryByBatch(d.Entries, "BA")
+	eB := entryByBatch(d.Entries, "BB")
+
+	// A 先拣 2，再对 B 报全缺；v2 应结转 A 的未拣余量 3。
+	if _, err := s.ConfirmPick(ConfirmPickRequest{WaveID: "W1", EntryID: eA.ID, Version: 1, Qty: 2}); err != nil {
+		t.Fatal(err)
+	}
+	v2, err := s.ReportShortage(ReportShortageRequest{WaveID: "W1", EntryID: eB.ID, Version: 1, Qty: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	carryA := entryByBatch(v2.Entries, "BA")
+	gapB := entryByBatch(v2.Entries, "BB2")
+	if carryA == nil || carryA.Qty != 3 || carryA.Reason != ReasonCarry {
+		t.Fatalf("A carry must hold remaining 3: %+v", carryA)
+	}
+	if gapB == nil || gapB.Qty != 5 || gapB.Reason != ReasonShortage {
+		t.Fatalf("B gap must backfill 5 from BB2: %+v", gapB)
+	}
+	if totalQty(v2.Entries) != 8 {
+		t.Fatalf("v2 holds 3 carried + 5 backfill = 8 units, got %d", totalQty(v2.Entries))
+	}
+	// BA2 是 SKU A，不能跨 SKU 补 B 的缺口，因此补位只应来自 BB2。
+	if e := entryByBatch(v2.Entries, "BA2"); e != nil {
+		t.Fatalf("SKU A batch must not backfill SKU B gap: %+v", e)
+	}
+	// A 历史明细上保留 2 件已拣，BB 核销 5。
+	dd, _ := s.GetWave("W1")
+	if got := entryByBatch(dd.Versions[0].Entries, "BA"); got == nil || got.Picked != 2 || got.Status != EntrySuperseded {
+		t.Fatalf("A history entry should keep 2 picked and be superseded: %+v", got)
+	}
+	bB, _ := s.GetBatch("BB")
+	if bB.OnHand != 0 {
+		t.Fatalf("BB should be fully written off: %+v", bB)
+	}
+}
+
+// ---- 3/5. 含 completed 明细的重排落盘后，重启重放一致 ----
+
+func TestShortageReplayWithCompletedSibling(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "waves.jsonl")
+	s, err := OpenService(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustRegister(t, s, BatchInput{ID: "BA", SKU: "A", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB", SKU: "B", OnHand: 5, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	mustRegister(t, s, BatchInput{ID: "BB2", SKU: "B", OnHand: 5, Expiry: date(2027, 1, 1), ReceivedAt: date(2026, 1, 1)})
+	d, _ := s.CreateWave(CreateWaveRequest{WaveID: "W1", Lines: []OrderLine{
+		{OrderID: "O1", SKU: "A", Qty: 5},
+		{OrderID: "O1", SKU: "B", Qty: 5},
+	}})
+	eA := entryByBatch(d.Entries, "BA")
+	eB := entryByBatch(d.Entries, "BB")
+	if _, err := s.ConfirmPick(ConfirmPickRequest{WaveID: "W1", EntryID: eA.ID, Version: 1, Qty: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ReportShortage(ReportShortageRequest{WaveID: "W1", EntryID: eB.ID, Version: 1, Qty: 5}); err != nil {
+		t.Fatalf("reallocation: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := OpenService(path)
+	if err != nil {
+		t.Fatalf("replay must tolerate completed sibling entries: %v", err)
+	}
+	defer s2.Close()
+	dd, err := s2.GetWave("W1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dd.CurrentVersion != 2 || len(dd.Versions) != 2 {
+		t.Fatalf("replayed versions wrong: %+v", dd)
+	}
+	if got := entryByBatch(dd.Versions[0].Entries, "BA"); got == nil || got.Status != EntryCompleted || got.Picked != 5 {
+		t.Fatalf("replayed completed entry wrong: %+v", got)
+	}
+	if got := entryByBatch(dd.Entries, "BB2"); got == nil || got.Status != EntryActive || got.Qty != 5 {
+		t.Fatalf("replayed backfill entry wrong: %+v", got)
+	}
+	bA, _ := s2.GetBatch("BA")
+	bB, _ := s2.GetBatch("BB")
+	bB2, _ := s2.GetBatch("BB2")
+	if bA.Picked != 5 || bB.OnHand != 0 || bB2.Held != 5 {
+		t.Fatalf("replayed ledger wrong: BA=%+v BB=%+v BB2=%+v", bA, bB, bB2)
+	}
+}
