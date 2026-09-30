@@ -178,6 +178,43 @@ func TestConcurrentContention(t *testing.T) {
 	}
 }
 
+// ---- 2. 并发幂等：同号同集合并发提交只建一次波次、只占用一次 ----
+
+func TestConcurrentIdempotentCreate(t *testing.T) {
+	s := NewService()
+	mustRegister(t, s, BatchInput{ID: "B1", SKU: "A", OnHand: 10, Expiry: date(2026, 1, 1), ReceivedAt: date(2025, 1, 1)})
+	lines := []OrderLine{{OrderID: "O1", SKU: "A", Qty: 4}}
+
+	const n = 16
+	var wg sync.WaitGroup
+	results := make([]*WaveDetail, n)
+	errs := make([]error, n)
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i], errs[i] = s.CreateWave(CreateWaveRequest{WaveID: "W1", Lines: lines})
+		}()
+	}
+	wg.Wait()
+
+	for i := range errs {
+		if errs[i] != nil {
+			t.Fatalf("concurrent idempotent create[%d]: %v", i, errs[i])
+		}
+		if len(results[i].Entries) != 1 || results[i].Entries[0].ID != results[0].Entries[0].ID {
+			t.Fatalf("all submissions must return the same original allocation, got %+v vs %+v",
+				results[i].Entries, results[0].Entries)
+		}
+	}
+	// 只占用一次 4 件，不因并发重复占用。
+	b1, _ := s.GetBatch("B1")
+	if b1.Held != 4 || b1.Available != 6 {
+		t.Fatalf("stock must be held exactly once: %+v", b1)
+	}
+}
+
 // ---- 3. 缺货重排：保留历史、缺口补位、核销盘亏 ----
 
 func TestShortageReallocation(t *testing.T) {
